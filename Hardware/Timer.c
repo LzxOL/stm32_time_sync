@@ -1,15 +1,8 @@
 #include "stm32f10x.h"
 #include "Timer.h"
+#include "TimeSync_Config.h"
 #include <stdio.h>
 #include <string.h>
-
-#define CAMERA_TIMER_PRESCALER      (4800 - 1)   /* 72 MHz / 4800 = 15 kHz */
-#define CAMERA_TRIGGER_PERIOD       (1000 - 1)   /* 15 kHz / 1000 = 15 Hz */
-#define CAMERA_TRIGGER_PULSE        (150)        /* 10 ms high pulse at 15 kHz */
-
-#define PPS_TIMER_PRESCALER         (7200 - 1)   /* 72 MHz / 7200 = 10 kHz */
-#define PPS_PERIOD                  (10000 - 1)  /* 10 kHz / 10000 = 1 Hz */
-#define PPS_PULSE                   (1000)       /* 100 ms high pulse */
 
 #define GPRMC_BAUDRATE              9600
 #define GPRMC_BUFFER_SIZE           128
@@ -29,6 +22,14 @@ static DateTime g_current_utc = {0, 0, 0, 0, 0, 0};
 static DateTime g_pending_utc = {0, 0, 0, 0, 0, 0};
 static volatile uint8_t g_current_time_valid = 0;
 static volatile uint8_t g_pending_time_valid = 0;
+static volatile uint8_t g_gprmc_pending = 0;
+static volatile uint32_t g_pps_count = 0;
+static volatile uint8_t g_camera_period_index = 0;
+/* PWM2 gives one 10 ms high pulse at the END of each period. After PPS 10,
+ * rising edges occur at +90, +290, +590, +990, +1056.6667 ms; the edge
+ * intervals 200/300/400/66.6667 ms identify the reference without a PC UART.
+ * Normal acquisition then continues at 15 Hz, with no further timer resets. */
+static const uint16_t g_camera_periods[] = {1500, 3000, 4500, 6000, 1000};
 
 static volatile char g_host_rx_buffer[HOST_RX_BUFFER_SIZE];
 static volatile uint8_t g_host_rx_index = 0;
@@ -44,13 +45,21 @@ static uint8_t DaysInMonth(uint16_t year, uint8_t month);
 static void IncrementUtcOneSecond(DateTime *time);
 static void ConvertBeijingToUtc(DateTime *time);
 static uint8_t ParseHostTimeCommand(const char *command, DateTime *utc_time);
-static void SendGprmcSentence(void);
+static void SendGprmcSentence(const DateTime *time);
+
+static void CameraPreloadPeriod(uint16_t ticks)
+{
+	TIM_SetAutoreload(TIM2, ticks - 1U);
+	TIM_SetCompare1(TIM2, ticks - CAMERA_TRIGGER_PULSE);
+	TIM_SetCompare2(TIM2, ticks - CAMERA_TRIGGER_PULSE);
+}
 
 void CameraTrigger_Init(void)
 {
 	GPIO_InitTypeDef gpio_init;
 	TIM_TimeBaseInitTypeDef tim_base_init;
 	TIM_OCInitTypeDef tim_oc_init;
+	NVIC_InitTypeDef nvic_init;
 
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_AFIO, ENABLE);
 	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
@@ -62,17 +71,17 @@ void CameraTrigger_Init(void)
 	gpio_init.GPIO_Speed = GPIO_Speed_50MHz;
 	GPIO_Init(GPIOA, &gpio_init);
 
-	tim_base_init.TIM_Period = CAMERA_TRIGGER_PERIOD;
+	tim_base_init.TIM_Period = g_camera_periods[0] - 1U;
 	tim_base_init.TIM_Prescaler = CAMERA_TIMER_PRESCALER;
 	tim_base_init.TIM_ClockDivision = TIM_CKD_DIV1;
 	tim_base_init.TIM_CounterMode = TIM_CounterMode_Up;
 	TIM_TimeBaseInit(TIM2, &tim_base_init);
 
 	TIM_OCStructInit(&tim_oc_init);
-	tim_oc_init.TIM_OCMode = TIM_OCMode_PWM1;
+	tim_oc_init.TIM_OCMode = TIM_OCMode_PWM2;
 	tim_oc_init.TIM_OutputState = TIM_OutputState_Enable;
 	tim_oc_init.TIM_OCPolarity = TIM_OCPolarity_High;
-	tim_oc_init.TIM_Pulse = CAMERA_TRIGGER_PULSE;
+	tim_oc_init.TIM_Pulse = g_camera_periods[0] - CAMERA_TRIGGER_PULSE;
 
 	TIM_OC1Init(TIM2, &tim_oc_init);
 	TIM_OC1PreloadConfig(TIM2, TIM_OCPreload_Enable);
@@ -81,21 +90,53 @@ void CameraTrigger_Init(void)
 	TIM_OC2PreloadConfig(TIM2, TIM_OCPreload_Enable);
 
 	TIM_ARRPreloadConfig(TIM2, ENABLE);
+	TIM_GenerateEvent(TIM2, TIM_EventSource_Update);
 	TIM_SetCounter(TIM2, 0);
-	TIM_Cmd(TIM2, ENABLE);
+	/* Load the NEXT period into shadow registers before the first update.
+	   TIM2 ITR2 is TIM3 TRGO on STM32F103. Trigger mode starts TIM2 in hardware
+	   at PPS 10, independently of interrupt and UART latency. PWM2 stays low
+	   while stopped; it must not emit a false trigger during initialization. */
+	CameraPreloadPeriod(g_camera_periods[1]);
+	TIM_SelectInputTrigger(TIM2, TIM_TS_ITR2);
+	TIM_SelectSlaveMode(TIM2, TIM_SlaveMode_Trigger);
+	TIM_ClearFlag(TIM2, TIM_FLAG_Update);
+	TIM_ITConfig(TIM2, TIM_IT_Update, ENABLE);
+	nvic_init.NVIC_IRQChannel = TIM2_IRQn;
+	nvic_init.NVIC_IRQChannelPreemptionPriority = 0;
+	nvic_init.NVIC_IRQChannelSubPriority = 1;
+	nvic_init.NVIC_IRQChannelCmd = ENABLE;
+	NVIC_Init(&nvic_init);
 }
 
 void TimeSync_Init(void)
 {
+#if TIME_SYNC_RELATIVE_CLOCK
+	DateTime relative_epoch = {2000, 1, 1, 0, 0, 0};
+	g_current_utc = relative_epoch;
+	g_current_time_valid = 1;
+#endif
 	GprmcUart_Init();
-	CameraTrigger_Init();
 	LidarPps_Init();
+	/* TIM3 initialization generates UG/TRGO. Connect the TIM2 slave only
+	   afterwards, so that initialization cannot start the camera timer. */
+	CameraTrigger_Init();
 }
 
 void TimeSync_ProcessHostCommand(void)
 {
 	char command_buffer[HOST_RX_BUFFER_SIZE];
 	DateTime parsed_utc;
+	DateTime sentence_time;
+	uint8_t send_pending;
+
+	/* Keep the 9600-baud ~90 ms transmission OUTSIDE timer interrupts. */
+	__disable_irq();
+	send_pending = g_gprmc_pending;
+	g_gprmc_pending = 0;
+	sentence_time = g_current_utc;
+	__enable_irq();
+	if (send_pending)
+		SendGprmcSentence(&sentence_time);
 
 	if (g_host_command_ready == 0)
 	{
@@ -106,6 +147,13 @@ void TimeSync_ProcessHostCommand(void)
 	strcpy(command_buffer, (const char *)g_host_rx_buffer);
 	g_host_command_ready = 0;
 	__enable_irq();
+
+#if TIME_SYNC_RELATIVE_CLOCK
+	/* An unsolicited host date must not invalidate the known marker epoch.
+	   Relative mode intentionally requires no PC time-command connection. */
+	(void)parsed_utc;
+	return;
+#endif
 
 	if (ParseHostTimeCommand(command_buffer, &parsed_utc))
 	{
@@ -119,6 +167,11 @@ void TimeSync_ProcessHostCommand(void)
 unsigned char TimeSync_IsUtcValid(void)
 {
 	return (unsigned char)((g_current_time_valid != 0) || (g_pending_time_valid != 0));
+}
+
+unsigned char TimeSync_CameraRunning(void)
+{
+	return (unsigned char)(g_camera_period_index >= 4U);
 }
 
 static void GprmcUart_Init(void)
@@ -460,7 +513,7 @@ static uint8_t ParseHostTimeCommand(const char *command, DateTime *utc_time)
 	return 1;
 }
 
-static void SendGprmcSentence(void)
+static void SendGprmcSentence(const DateTime *time)
 {
 	char sentence[GPRMC_BUFFER_SIZE];
 	uint8_t checksum;
@@ -473,12 +526,12 @@ static void SendGprmcSentence(void)
 
 	sprintf(sentence,
 	        "$GPRMC,%02u%02u%02u.00,A,2237.496474,N,11356.089515,E,0.0,225.5,%02u%02u%02u,2.3,W,A*",
-	        g_current_utc.hour,
-	        g_current_utc.minute,
-	        g_current_utc.second,
-	        g_current_utc.day,
-	        g_current_utc.month,
-	        (uint8_t)(g_current_utc.year % 100U));
+	        time->hour,
+	        time->minute,
+	        time->second,
+	        time->day,
+	        time->month,
+	        (uint8_t)(time->year % 100U));
 
 	checksum = NmeaChecksum(sentence);
 	sentence_length = strlen(sentence);
@@ -529,6 +582,9 @@ void TIM3_IRQHandler(void)
 	if (TIM_GetITStatus(TIM3, TIM_IT_Update) != RESET)
 	{
 		TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
+		g_pps_count++;
+		if (g_pps_count == CAMERA_START_PPS - 1U)
+			TIM_SelectOutputTrigger(TIM3, TIM_TRGOSource_Update);
 
 		if (g_pending_time_valid != 0)
 		{
@@ -541,6 +597,19 @@ void TIM3_IRQHandler(void)
 			IncrementUtcOneSecond(&g_current_utc);
 		}
 
-		SendGprmcSentence();
+		g_gprmc_pending = 1;
+	}
+}
+
+void TIM2_IRQHandler(void)
+{
+	if (TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET)
+	{
+		TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
+		g_camera_period_index++;
+		if (g_camera_period_index < 4U)
+			CameraPreloadPeriod(g_camera_periods[g_camera_period_index + 1U]);
+		else
+			TIM_ITConfig(TIM2, TIM_IT_Update, DISABLE);
 	}
 }

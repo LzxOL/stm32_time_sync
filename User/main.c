@@ -5,6 +5,7 @@
 
 int main(void)
 {
+	unsigned int display_ticks = 0;
 	OLED_Init();
 	TimeSync_Init();
 
@@ -15,14 +16,16 @@ int main(void)
 	while (1)
 	{
 		TimeSync_ProcessHostCommand();
-		if (TimeSync_IsUtcValid())
+		if (display_ticks++ >= 100)
 		{
-			OLED_ShowString(1, 1, "TIME: LOCKED  ");
+			display_ticks = 0;
+			if (TimeSync_CameraRunning())
+				OLED_ShowString(1, 1, "REL: CAM RUN15 ");
+			else if (TimeSync_IsUtcValid())
+				OLED_ShowString(1, 1, "REL: SYNC WAIT ");
+			else
+				OLED_ShowString(1, 1, "TIME: WAIT PC  ");
 		}
-		else
-		{
-			OLED_ShowString(1, 1, "TIME: WAIT PC ");
-		}
-		Delay_ms(100);
+		Delay_ms(1);
 	}
 }
