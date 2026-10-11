@@ -3,9 +3,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CAMERA_TIMER_PRESCALER      (24000 - 1)  /* 72 MHz / 24000 = 3 kHz */
-#define CAMERA_TRIGGER_PERIOD       (375 - 1)    /* 3 kHz / 375 = 8 Hz */
-#define CAMERA_TRIGGER_PULSE        (30)         /* 10 ms high pulse at 3 kHz */
+#define CAMERA_TIMER_PRESCALER      (4800 - 1)   /* 72 MHz / 4800 = 15 kHz */
+#define CAMERA_TRIGGER_PERIOD       (1000 - 1)   /* 15 kHz / 1000 = 15 Hz */
+#define CAMERA_TRIGGER_PULSE        (150)        /* 10 ms high pulse at 15 kHz */
 
 #define PPS_TIMER_PRESCALER         (7200 - 1)   /* 72 MHz / 7200 = 10 kHz */
 #define PPS_PERIOD                  (10000 - 1)  /* 10 kHz / 10000 = 1 Hz */
@@ -454,7 +454,7 @@ static uint8_t ParseHostTimeCommand(const char *command, DateTime *utc_time)
 		ConvertBeijingToUtc(&parsed_time);
 	}
 
-	/* Apply the host-provided current time on the next PPS edge. */
+	/* Apply the host-provided current time on the next one-second boundary. */
 	IncrementUtcOneSecond(&parsed_time);
 	*utc_time = parsed_time;
 	return 1;
@@ -529,10 +529,6 @@ void TIM3_IRQHandler(void)
 	if (TIM_GetITStatus(TIM3, TIM_IT_Update) != RESET)
 	{
 		TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
-
-		/* Keep camera trigger and PPS on the same MCU clock, but do not reset
-		   TIM2 here. 8 Hz cannot stay exact if it is forcibly realigned every
-		   1 second. */
 
 		if (g_pending_time_valid != 0)
 		{
