@@ -26,10 +26,10 @@ static volatile uint8_t g_gprmc_pending = 0;
 static volatile uint32_t g_pps_count = 0;
 static volatile uint8_t g_camera_period_index = 0;
 /* PWM2 gives one 10 ms high pulse at the END of each period. After PPS 10,
- * rising edges occur at +90, +290, +590, +990, +1056.6667 ms; the edge
- * intervals 200/300/400/66.6667 ms identify the reference without a PC UART.
- * Normal acquisition then continues at 15 Hz, with no further timer resets. */
-static const uint16_t g_camera_periods[] = {1500, 3000, 4500, 6000, 1000};
+ * the first four rising edges occur at +90, +290, +590, +990 ms. The
+ * intervals 200/300/400 ms identify the reference without a PC UART.
+ * Normal acquisition then continues at CAMERA_TRIGGER_HZ, with no resets. */
+static const uint16_t g_camera_periods[] = {1500, 3000, 4500, 6000, CAMERA_TRIGGER_PERIOD + 1U};
 
 static volatile char g_host_rx_buffer[HOST_RX_BUFFER_SIZE];
 static volatile uint8_t g_host_rx_index = 0;

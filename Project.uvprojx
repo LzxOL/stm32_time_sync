@@ -690,6 +690,11 @@
               <FileType>5</FileType>
               <FilePath>.\Hardware\OLED_Font.h</FilePath>
             </File>
+            <File>
+              <FileName>TimeSync_Config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\TimeSync_Config.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
